@@ -9,6 +9,8 @@
  * - Creating new features from specifications
  * - Fixing bugs across multiple files
  *
+ * All code runs in a secure Vercel Sandbox - NO access to your local filesystem.
+ *
  * Usage:
  *   npx tsx index.ts /path/to/repo                    # Interactive mode or uses PROMPT.md
  *   npx tsx index.ts /path/to/repo "Your task"        # Uses provided prompt
@@ -16,6 +18,9 @@
  *
  * Environment:
  *   ANTHROPIC_API_KEY - Your Anthropic API key
+ *   SANDBOX_VERCEL_TOKEN - Vercel API token for sandbox
+ *   SANDBOX_VERCEL_TEAM_ID - Vercel team ID
+ *   SANDBOX_VERCEL_PROJECT_ID - Vercel project ID
  */
 
 import {
@@ -27,45 +32,13 @@ import { tool, generateText, stepCountIs } from 'ai';
 import { z } from 'zod';
 import * as fs from 'fs/promises';
 import * as path from 'path';
-import { glob } from 'glob';
-import { exec } from 'child_process';
-import { promisify } from 'util';
 import prompts from 'prompts';
-import { chromium, Browser, Page } from 'playwright';
-
-const execAsync = promisify(exec);
-
-// Browser management
-let browser: Browser | null = null;
-let browserPage: Page | null = null;
-
-async function getBrowserPage(): Promise<Page> {
-  if (!browser) {
-    browser = await chromium.launch({ headless: true });
-  }
-  if (!browserPage || browserPage.isClosed()) {
-    const context = await browser.newContext({
-      viewport: { width: 1280, height: 720 },
-    });
-    browserPage = await context.newPage();
-  }
-  return browserPage;
-}
-
-async function closeBrowser() {
-  if (browserPage) {
-    await browserPage.close().catch(() => {});
-    browserPage = null;
-  }
-  if (browser) {
-    await browser.close().catch(() => {});
-    browser = null;
-  }
-}
+import { Sandbox } from '@vercel/sandbox';
 
 // Constants for context management
 const MAX_FILE_CHARS = 30_000;
 const MAX_FILE_LINES_PREVIEW = 400;
+const SANDBOX_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
 
 // ANSI color codes
 const colors = {
@@ -105,6 +78,225 @@ if (!targetDir) {
 
 const resolvedDir = path.resolve(targetDir.replace('~', process.env.HOME || ''));
 
+// Check required env vars
+const requiredEnvVars = ['SANDBOX_VERCEL_TOKEN', 'SANDBOX_VERCEL_TEAM_ID', 'SANDBOX_VERCEL_PROJECT_ID'];
+for (const envVar of requiredEnvVars) {
+  if (!process.env[envVar]) {
+    console.error(`Error: ${envVar} environment variable is required`);
+    console.error('');
+    console.error('Required environment variables:');
+    console.error('  SANDBOX_VERCEL_TOKEN     - Your Vercel API token');
+    console.error('  SANDBOX_VERCEL_TEAM_ID   - Your Vercel team ID');
+    console.error('  SANDBOX_VERCEL_PROJECT_ID - Your Vercel project ID');
+    process.exit(1);
+  }
+}
+
+// Sandbox management
+let sandbox: Sandbox | null = null;
+let sandboxDomain: string | null = null;
+
+/**
+ * Helper to convert ReadableStream to string
+ */
+async function streamToString(stream: NodeJS.ReadableStream): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) {
+    chunks.push(Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks).toString('utf-8');
+}
+
+/**
+ * Initialize the sandbox and copy files from local directory
+ */
+async function initializeSandbox(): Promise<void> {
+  log('  🔒 Creating secure sandbox...', 'cyan');
+  
+  sandbox = await Sandbox.create({
+    runtime: 'node22',
+    timeout: SANDBOX_TIMEOUT_MS,
+    ports: [3000],
+    token: process.env.SANDBOX_VERCEL_TOKEN!,
+    teamId: process.env.SANDBOX_VERCEL_TEAM_ID!,
+    projectId: process.env.SANDBOX_VERCEL_PROJECT_ID!,
+    resources: { vcpus: 4 },
+  });
+
+  sandboxDomain = sandbox.domain(3000);
+  log(`  ✓ Sandbox created (${sandbox.sandboxId})`, 'green');
+  log(`  📡 Dev server URL: https://${sandboxDomain}`, 'dim');
+
+  // Copy files from local directory to sandbox
+  await copyLocalToSandbox(resolvedDir);
+}
+
+/**
+ * Copy files from local directory to sandbox
+ */
+async function copyLocalToSandbox(localDir: string): Promise<void> {
+  log('  📦 Copying project files to sandbox...', 'cyan');
+  
+  const filesToCopy: { path: string; content: Buffer }[] = [];
+  
+  async function collectFiles(dir: string, prefix = ''): Promise<void> {
+    try {
+      const entries = await fs.readdir(dir, { withFileTypes: true });
+      
+      for (const entry of entries) {
+        const localPath = path.join(dir, entry.name);
+        const sandboxPath = prefix ? `${prefix}/${entry.name}` : entry.name;
+        
+        // Skip node_modules, .git, and other large directories
+        if (['node_modules', '.git', 'dist', '.next', 'build', '.cache'].includes(entry.name)) {
+          continue;
+        }
+        
+        if (entry.isDirectory()) {
+          await collectFiles(localPath, sandboxPath);
+        } else if (entry.isFile()) {
+          try {
+            const content = await fs.readFile(localPath);
+            // Skip files larger than 1MB
+            if (content.length < 1024 * 1024) {
+              filesToCopy.push({ path: sandboxPath, content });
+            }
+          } catch {
+            // Skip unreadable files
+          }
+        }
+      }
+    } catch {
+      // Directory doesn't exist or isn't readable - that's fine for new projects
+    }
+  }
+
+  await collectFiles(localDir);
+  
+  if (filesToCopy.length > 0) {
+    // Write files in batches to avoid overwhelming the sandbox
+    const batchSize = 50;
+    for (let i = 0; i < filesToCopy.length; i += batchSize) {
+      const batch = filesToCopy.slice(i, i + batchSize);
+      await sandbox!.writeFiles(batch);
+    }
+    log(`  ✓ Copied ${filesToCopy.length} files to sandbox`, 'green');
+  } else {
+    log(`  ℹ️  Starting with empty sandbox (new project)`, 'dim');
+  }
+}
+
+/**
+ * Copy files from sandbox back to local directory
+ */
+async function copySandboxToLocal(localDir: string): Promise<void> {
+  log('  📦 Copying changes back to local...', 'cyan');
+  
+  // Get list of files in sandbox
+  const cmd = await sandbox!.runCommand({
+    cmd: 'find',
+    args: ['.', '-type', 'f', '-not', '-path', './node_modules/*', '-not', '-path', './.git/*'],
+    detached: true,
+  });
+  
+  let stdout = '';
+  try {
+    for await (const logEntry of cmd.logs()) {
+      if (logEntry.stream === 'stdout') stdout += logEntry.data;
+    }
+  } catch {
+    // Ignore streaming errors
+  }
+  await cmd.wait();
+
+  const files = stdout.split('\n').filter(f => f.trim() && f !== '.');
+  let copiedCount = 0;
+
+  for (const file of files) {
+    const sandboxPath = file.replace(/^\.\//, '');
+    const localPath = path.join(localDir, sandboxPath);
+    
+    try {
+      const stream = await sandbox!.readFile({ path: sandboxPath });
+      if (stream) {
+        const content = await streamToString(stream);
+        await fs.mkdir(path.dirname(localPath), { recursive: true });
+        await fs.writeFile(localPath, content, 'utf-8');
+        copiedCount++;
+      }
+    } catch {
+      // Skip files that can't be read
+    }
+  }
+
+  log(`  ✓ Copied ${copiedCount} files back to local`, 'green');
+}
+
+/**
+ * Close and cleanup the sandbox
+ */
+async function closeSandbox(): Promise<void> {
+  if (sandbox) {
+    try {
+      // Copy files back before closing
+      await copySandboxToLocal(resolvedDir);
+      await sandbox.close();
+      log('  🔒 Sandbox closed', 'dim');
+    } catch {
+      // Ignore close errors
+    }
+    sandbox = null;
+    sandboxDomain = null;
+  }
+}
+
+/**
+ * Run a command in the sandbox
+ */
+async function runInSandbox(command: string): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  if (!sandbox) throw new Error('Sandbox not initialized');
+  
+  const cmd = await sandbox.runCommand({
+    cmd: 'sh',
+    args: ['-c', command],
+    detached: true,
+  });
+
+  let stdout = '';
+  let stderr = '';
+
+  try {
+    for await (const logEntry of cmd.logs()) {
+      if (logEntry.stream === 'stdout') stdout += logEntry.data;
+      if (logEntry.stream === 'stderr') stderr += logEntry.data;
+    }
+  } catch {
+    // Ignore streaming errors
+  }
+
+  const result = await cmd.wait();
+  return { stdout, stderr, exitCode: result.exitCode };
+}
+
+/**
+ * Read a file from the sandbox
+ */
+async function readFromSandbox(filePath: string): Promise<string | null> {
+  if (!sandbox) throw new Error('Sandbox not initialized');
+  
+  const stream = await sandbox.readFile({ path: filePath });
+  if (!stream) return null;
+  return streamToString(stream);
+}
+
+/**
+ * Write a file to the sandbox
+ */
+async function writeToSandbox(filePath: string, content: string): Promise<void> {
+  if (!sandbox) throw new Error('Sandbox not initialized');
+  await sandbox.writeFiles([{ path: filePath, content: Buffer.from(content) }]);
+}
+
 // Task types for the interview
 const TASK_TYPES = [
   { title: 'Create', value: 'create', description: 'Create a new project, app, or library from scratch' },
@@ -124,76 +316,72 @@ const VERIFICATION_METHODS = [
   { title: 'Manual verification', value: 'manual', selected: false },
 ];
 
-// Tools for the interviewer agent to explore the codebase
-const interviewerTools = {
-  listFiles: tool({
-    description: 'List files matching a glob pattern to understand project structure',
-    inputSchema: z.object({
-      pattern: z.string().describe('Glob pattern like "**/*.ts" or "src/**/*"'),
-    }),
-    execute: async ({ pattern }) => {
-      try {
-        const files = await glob(pattern, { 
-          cwd: resolvedDir, 
-          nodir: true,
-          ignore: ['**/node_modules/**', '**/dist/**', '**/.next/**', '**/build/**'],
-        });
-        return { files: files.slice(0, 50) };
-      } catch (error) {
-        return { error: String(error) };
-      }
-    },
-  }),
-
-  readFile: tool({
-    description: 'Read a file to understand its contents',
-    inputSchema: z.object({
-      filePath: z.string().describe('Path to the file'),
-    }),
-    execute: async ({ filePath }) => {
-      try {
-        const fullPath = path.join(resolvedDir, filePath);
-        const content = await fs.readFile(fullPath, 'utf-8');
-        return { content: content.slice(0, 5000) };
-      } catch (error) {
-        return { error: String(error) };
-      }
-    },
-  }),
-
-  listDirectory: tool({
-    description: 'List contents of a directory',
-    inputSchema: z.object({
-      dirPath: z.string().optional().describe('Directory path (default: root)'),
-    }),
-    execute: async ({ dirPath }) => {
-      try {
-        const fullPath = path.join(resolvedDir, dirPath || '.');
-        const entries = await fs.readdir(fullPath, { withFileTypes: true });
-        const listing = entries.slice(0, 50).map(e => ({
-          name: e.name,
-          type: e.isDirectory() ? 'dir' : 'file',
-        }));
-        return { entries: listing };
-      } catch (error) {
-        return { error: String(error) };
-      }
-    },
-  }),
-
-  provideSuggestions: tool({
-    description: 'Provide suggestions for a question based on your analysis of the codebase',
-    inputSchema: z.object({
-      suggestions: z.array(z.string()).length(3).describe('Exactly 3 specific, actionable suggestions based on the codebase'),
-    }),
-    execute: async ({ suggestions }) => {
-      return { suggestions };
-    },
-  }),
-};
-
 // Cache for codebase analysis (explored once, reused for all questions)
 let codebaseAnalysis: string | null = null;
+
+/**
+ * Create interviewer tools that use the sandbox
+ */
+function createInterviewerTools() {
+  return {
+    listFiles: tool({
+      description: 'List files matching a pattern to understand project structure',
+      inputSchema: z.object({
+        pattern: z.string().describe('Glob-like pattern like "*.ts" or "src/"'),
+      }),
+      execute: async ({ pattern }) => {
+        try {
+          const result = await runInSandbox(`find . -type f -name "${pattern}" | head -50 | grep -v node_modules | grep -v .git`);
+          const files = result.stdout.split('\n').filter(f => f.trim()).map(f => f.replace(/^\.\//, ''));
+          return { files };
+        } catch (error) {
+          return { error: String(error) };
+        }
+      },
+    }),
+
+    readFile: tool({
+      description: 'Read a file to understand its contents',
+      inputSchema: z.object({
+        filePath: z.string().describe('Path to the file'),
+      }),
+      execute: async ({ filePath }) => {
+        try {
+          const content = await readFromSandbox(filePath);
+          if (!content) return { error: 'File not found' };
+          return { content: content.slice(0, 5000) };
+        } catch (error) {
+          return { error: String(error) };
+        }
+      },
+    }),
+
+    listDirectory: tool({
+      description: 'List contents of a directory',
+      inputSchema: z.object({
+        dirPath: z.string().optional().describe('Directory path (default: root)'),
+      }),
+      execute: async ({ dirPath }) => {
+        try {
+          const result = await runInSandbox(`ls -la ${dirPath || '.'}`);
+          return { listing: result.stdout };
+        } catch (error) {
+          return { error: String(error) };
+        }
+      },
+    }),
+
+    provideSuggestions: tool({
+      description: 'Provide suggestions for a question based on your analysis of the codebase',
+      inputSchema: z.object({
+        suggestions: z.array(z.string()).length(3).describe('Exactly 3 specific, actionable suggestions based on the codebase'),
+      }),
+      execute: async ({ suggestions }) => {
+        return { suggestions };
+      },
+    }),
+  };
+}
 
 /**
  * Explore the codebase once and cache the analysis.
@@ -206,6 +394,7 @@ async function exploreCodebase(taskType: string, title: string, techStack?: stri
   log('  🔍 AI exploring codebase...', 'cyan');
 
   try {
+    const interviewerTools = createInterviewerTools();
     const result = await generateText({
       model: 'anthropic/claude-opus-4.5' as any,
       tools: interviewerTools,
@@ -296,7 +485,7 @@ Question: ${question}`,
       .slice(0, 5);
 
     return suggestions.length > 0 ? suggestions : ['Define the core requirement'];
-  } catch (error) {
+  } catch {
     return ['Define the core requirement'];
   }
 }
@@ -530,13 +719,14 @@ async function getTaskPrompt(): Promise<{ prompt: string; source: string }> {
     return { prompt: promptArg, source: 'CLI argument' };
   }
 
-  // Check for PROMPT.md in target directory
-  const promptMdPath = path.join(resolvedDir, 'PROMPT.md');
+  // Check for PROMPT.md in sandbox
   try {
-    const content = await fs.readFile(promptMdPath, 'utf-8');
-    return { prompt: content.trim(), source: promptMdPath };
+    const content = await readFromSandbox('PROMPT.md');
+    if (content) {
+      return { prompt: content.trim(), source: 'PROMPT.md (from sandbox)' };
+    }
   } catch {
-    // No PROMPT.md found - run interactive interview
+    // No PROMPT.md found
   }
 
   // Run interactive interview
@@ -545,658 +735,406 @@ async function getTaskPrompt(): Promise<{ prompt: string; source: string }> {
   const { prompt, saveToFile } = await runInterview();
 
   if (saveToFile) {
-    await fs.writeFile(promptMdPath, prompt, 'utf-8');
-    log(`\n✓ Saved to ${promptMdPath}`, 'green');
+    await writeToSandbox('PROMPT.md', prompt);
+    log(`\n✓ Saved PROMPT.md to sandbox`, 'green');
   }
 
-  return { prompt, source: saveToFile ? promptMdPath : 'interactive' };
+  return { prompt, source: saveToFile ? 'PROMPT.md' : 'interactive' };
 }
 
-// Define tools for the agent
-const tools = {
-  listFiles: tool({
-    description: 'List files in a directory matching a glob pattern',
-    inputSchema: z.object({
-      pattern: z.string().describe('Glob pattern like "**/*.js" or "src/**/*.ts"'),
-    }),
-    execute: async ({ pattern }) => {
-      try {
-        const files = await glob(pattern, { cwd: resolvedDir, nodir: true });
-        log(`  📂 Found ${files.length} files matching "${pattern}"`, 'dim');
-        return { success: true, files: files.slice(0, 100) }; // Limit to 100 files
-      } catch (error) {
-        return { success: false, error: String(error) };
-      }
-    },
-  }),
-
-  readFile: tool({
-    description: 'Read the contents of a file. For large files, use lineStart/lineEnd to read specific sections.',
-    inputSchema: z.object({
-      filePath: z.string().describe('Path to the file relative to the project root'),
-      lineStart: z.number().optional().describe('Start line (1-indexed). Use for large files.'),
-      lineEnd: z.number().optional().describe('End line (inclusive). Use for large files.'),
-    }),
-    execute: async ({ filePath, lineStart, lineEnd }) => {
-      try {
-        const fullPath = path.join(resolvedDir, filePath);
-        const content = await fs.readFile(fullPath, 'utf-8');
-        const lines = content.split('\n');
-        const totalLines = lines.length;
-        
-        // If specific range requested, extract it
-        if (lineStart !== undefined || lineEnd !== undefined) {
-          const start = Math.max(1, lineStart ?? 1);
-          const end = Math.min(totalLines, lineEnd ?? totalLines);
-          const selectedLines = lines.slice(start - 1, end);
-          const numberedContent = selectedLines
-            .map((line, i) => `${String(start + i).padStart(6)}| ${line}`)
-            .join('\n');
-          log(`  📖 Read: ${filePath} lines ${start}-${end} of ${totalLines}`, 'dim');
-          return { 
-            success: true, 
-            content: numberedContent,
-            totalLines,
-            lineRange: { start, end },
-          };
-        }
-        
-        // Auto-truncate large files
-        if (content.length > MAX_FILE_CHARS) {
-          const maxLines = Math.min(MAX_FILE_LINES_PREVIEW, totalLines);
-          const selectedLines = lines.slice(0, maxLines);
-          const numberedContent = selectedLines
-            .map((line, i) => `${String(i + 1).padStart(6)}| ${line}`)
-            .join('\n');
-          const warning = `\n\n... [TRUNCATED: File has ${totalLines} lines, showing 1-${maxLines}. Use lineStart/lineEnd to read specific sections] ...`;
-          log(`  📖 Read: ${filePath} (TRUNCATED: ${totalLines} lines, showing 1-${maxLines})`, 'yellow');
-          return { 
-            success: true, 
-            content: numberedContent + warning,
-            totalLines,
-            truncated: true,
-            lineRange: { start: 1, end: maxLines },
-          };
-        }
-        
-        log(`  📖 Read: ${filePath} (${content.length} chars)`, 'dim');
-        return { success: true, content, totalLines };
-      } catch (error) {
-        return { success: false, error: String(error) };
-      }
-    },
-  }),
-
-  writeFile: tool({
-    description: 'Write content to a file (creates directories if needed). For small changes, prefer editFile instead.',
-    inputSchema: z.object({
-      filePath: z.string().describe('Path to the file relative to the project root'),
-      content: z.string().describe('The content to write to the file'),
-    }),
-    execute: async ({ filePath, content }) => {
-      try {
-        const fullPath = path.join(resolvedDir, filePath);
-        await fs.mkdir(path.dirname(fullPath), { recursive: true });
-        await fs.writeFile(fullPath, content, 'utf-8');
-        log(`  ✏️  Wrote: ${filePath}`, 'green');
-        return { success: true, filePath };
-      } catch (error) {
-        return { success: false, error: String(error) };
-      }
-    },
-  }),
-
-  editFile: tool({
-    description: 'Make surgical edits to a file by replacing specific text. More token-efficient than writeFile for small changes. The old_string must be unique in the file.',
-    inputSchema: z.object({
-      filePath: z.string().describe('Path to the file relative to the project root'),
-      old_string: z.string().describe('Exact text to find and replace (must be unique in the file)'),
-      new_string: z.string().describe('Text to replace it with'),
-    }),
-    execute: async ({ filePath, old_string, new_string }) => {
-      try {
-        const fullPath = path.join(resolvedDir, filePath);
-        const content = await fs.readFile(fullPath, 'utf-8');
-        
-        // Check for exact match
-        const occurrences = content.split(old_string).length - 1;
-        if (occurrences === 0) {
-          return { 
-            success: false, 
-            error: 'old_string not found in file. Make sure it matches exactly (including whitespace).',
-          };
-        }
-        if (occurrences > 1) {
-          return { 
-            success: false, 
-            error: `old_string found ${occurrences} times - must be unique. Add more surrounding context to make it unique.`,
-          };
-        }
-        
-        // Perform replacement
-        const newContent = content.replace(old_string, new_string);
-        await fs.writeFile(fullPath, newContent, 'utf-8');
-        
-        log(`  🔧 Edited: ${filePath}`, 'green');
-        return { 
-          success: true, 
-          filePath,
-          replaced: old_string.length > 100 ? old_string.slice(0, 100) + '...' : old_string,
-          with: new_string.length > 100 ? new_string.slice(0, 100) + '...' : new_string,
-        };
-      } catch (error) {
-        return { success: false, error: String(error) };
-      }
-    },
-  }),
-
-  deleteFile: tool({
-    description: 'Delete a file',
-    inputSchema: z.object({
-      filePath: z.string().describe('Path to the file relative to the project root'),
-    }),
-    execute: async ({ filePath }) => {
-      try {
-        const fullPath = path.join(resolvedDir, filePath);
-        await fs.unlink(fullPath);
-        log(`  🗑️  Deleted: ${filePath}`, 'yellow');
-        return { success: true, filePath };
-      } catch (error) {
-        return { success: false, error: String(error) };
-      }
-    },
-  }),
-
-  runCommand: tool({
-    description: 'Run a shell command in the project directory',
-    inputSchema: z.object({
-      command: z.string().describe('The shell command to run'),
-    }),
-    execute: async ({ command }) => {
-      try {
-        log(`  🔧 Running: ${command}`, 'blue');
-        const { stdout, stderr } = await execAsync(command, {
-          cwd: resolvedDir,
-          timeout: 120000, // 2 minute timeout
-        });
-        const output = stdout + (stderr ? `\nSTDERR: ${stderr}` : '');
-        log(`  ✓ Command completed`, 'dim');
-        return { success: true, output: output.slice(0, 8000) }; // Limit output
-      } catch (error: any) {
-        log(`  ✗ Command failed`, 'red');
-        return {
-          success: false,
-          error: error.message,
-          stdout: error.stdout?.slice(0, 3000),
-          stderr: error.stderr?.slice(0, 3000),
-        };
-      }
-    },
-  }),
-
-  markComplete: tool({
-    description: 'Mark the task as complete with a summary of what was done',
-    inputSchema: z.object({
-      summary: z.string().describe('Summary of what was accomplished'),
-      filesModified: z.array(z.string()).describe('List of files that were modified'),
-    }),
-    execute: async ({ summary, filesModified }) => {
-      log(`  ✅ Task marked complete`, 'green');
-      return { complete: true, summary, filesModified };
-    },
-  }),
-
-  // Browser tools for testing and verification
-  browserNavigate: tool({
-    description: 'Navigate the browser to a URL',
-    inputSchema: z.object({
-      url: z.string().describe('URL to navigate to'),
-    }),
-    execute: async ({ url }) => {
-      try {
-        const page = await getBrowserPage();
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        log(`  🌐 Navigated to: ${url}`, 'blue');
-        return { success: true, url: page.url(), title: await page.title() };
-      } catch (error) {
-        return { success: false, error: String(error) };
-      }
-    },
-  }),
-
-  browserSnapshot: tool({
-    description: 'Get a text representation of the current page structure - useful for understanding page content and layout',
-    inputSchema: z.object({}),
-    execute: async () => {
-      try {
-        const page = await getBrowserPage();
-        // Get a simplified view of the page content
-        const snapshot = await page.evaluate(() => {
-          const extractStructure = (el: Element, depth = 0): string => {
-            if (depth > 4) return '';
-            const tag = el.tagName.toLowerCase();
-            const text = el.textContent?.trim().slice(0, 50) || '';
-            const role = el.getAttribute('role') || '';
-            const href = el.getAttribute('href') || '';
-            const lines: string[] = [];
-            
-            if (['script', 'style', 'noscript'].includes(tag)) return '';
-            
-            const indent = '  '.repeat(depth);
-            let info = `${indent}<${tag}`;
-            if (role) info += ` role="${role}"`;
-            if (href) info += ` href="${href}"`;
-            if (text && !el.children.length) info += `>${text}</${tag}>`;
-            else info += '>';
-            lines.push(info);
-            
-            for (const child of el.children) {
-              const childStr = extractStructure(child, depth + 1);
-              if (childStr) lines.push(childStr);
-            }
-            return lines.join('\n');
-          };
-          return extractStructure(document.body);
-        });
-        log(`  📷 Got page snapshot`, 'dim');
-        return { success: true, snapshot: snapshot.slice(0, 15000) };
-      } catch (error) {
-        return { success: false, error: String(error) };
-      }
-    },
-  }),
-
-  browserClick: tool({
-    description: 'Click an element on the page',
-    inputSchema: z.object({
-      selector: z.string().describe('CSS selector or text content to click'),
-    }),
-    execute: async ({ selector }) => {
-      try {
-        const page = await getBrowserPage();
-        // Try CSS selector first, then text
+/**
+ * Create tools for the coding agent (all sandbox-based)
+ */
+function createCodingAgentTools() {
+  return {
+    listFiles: tool({
+      description: 'List files in the sandbox matching a pattern',
+      inputSchema: z.object({
+        pattern: z.string().describe('Pattern like "**/*.js" or "src/"'),
+      }),
+      execute: async ({ pattern }) => {
         try {
-          await page.click(selector, { timeout: 5000 });
-        } catch {
-          await page.getByText(selector).click({ timeout: 5000 });
+          const result = await runInSandbox(`find . -type f -path "*${pattern}*" | grep -v node_modules | grep -v .git | head -100`);
+          const files = result.stdout.split('\n').filter(f => f.trim()).map(f => f.replace(/^\.\//, ''));
+          log(`  📂 Found ${files.length} files matching "${pattern}"`, 'dim');
+          return { success: true, files };
+        } catch (error) {
+          return { success: false, error: String(error) };
         }
-        log(`  🖱️  Clicked: ${selector}`, 'dim');
-        return { success: true };
-      } catch (error) {
-        return { success: false, error: String(error) };
-      }
-    },
-  }),
-
-  browserType: tool({
-    description: 'Type text into an input element',
-    inputSchema: z.object({
-      selector: z.string().describe('CSS selector for the input'),
-      text: z.string().describe('Text to type'),
-      submit: z.boolean().optional().describe('Press Enter after typing'),
+      },
     }),
-    execute: async ({ selector, text, submit }) => {
-      try {
-        const page = await getBrowserPage();
-        await page.fill(selector, text);
-        if (submit) {
-          await page.press(selector, 'Enter');
-        }
-        log(`  ⌨️  Typed into: ${selector}`, 'dim');
-        return { success: true };
-      } catch (error) {
-        return { success: false, error: String(error) };
-      }
-    },
-  }),
 
-  browserScreenshot: tool({
-    description: 'Take a screenshot of the current page and save it to a file',
-    inputSchema: z.object({
-      filename: z.string().describe('Filename for the screenshot (e.g., "screenshot.png")'),
-      fullPage: z.boolean().optional().describe('Capture full scrollable page'),
-    }),
-    execute: async ({ filename, fullPage }) => {
-      try {
-        const page = await getBrowserPage();
-        const screenshotPath = path.join(resolvedDir, filename);
-        await page.screenshot({ path: screenshotPath, fullPage: fullPage ?? false });
-        log(`  📸 Screenshot saved: ${filename}`, 'green');
-        return { success: true, path: screenshotPath };
-      } catch (error) {
-        return { success: false, error: String(error) };
-      }
-    },
-  }),
-
-  browserGetContent: tool({
-    description: 'Get the text content of the page or a specific element',
-    inputSchema: z.object({
-      selector: z.string().optional().describe('CSS selector (omit for full page)'),
-    }),
-    execute: async ({ selector }) => {
-      try {
-        const page = await getBrowserPage();
-        let content: string;
-        if (selector) {
-          content = await page.locator(selector).textContent() || '';
-        } else {
-          content = await page.evaluate(() => document.body.innerText);
-        }
-        log(`  📄 Got page content${selector ? ` for ${selector}` : ''}`, 'dim');
-        return { success: true, content: content.slice(0, 10000) };
-      } catch (error) {
-        return { success: false, error: String(error) };
-      }
-    },
-  }),
-
-  browserWait: tool({
-    description: 'Wait for a condition on the page',
-    inputSchema: z.object({
-      selector: z.string().optional().describe('Wait for this selector to appear'),
-      text: z.string().optional().describe('Wait for this text to appear'),
-      timeout: z.number().optional().describe('Max wait time in ms (default 5000)'),
-    }),
-    execute: async ({ selector, text, timeout }) => {
-      try {
-        const page = await getBrowserPage();
-        const waitTimeout = timeout ?? 5000;
-        if (selector) {
-          await page.waitForSelector(selector, { timeout: waitTimeout });
-          log(`  ⏳ Waited for selector: ${selector}`, 'dim');
-        } else if (text) {
-          await page.waitForFunction(
-            (t: string) => document.body.innerText.includes(t),
-            text,
-            { timeout: waitTimeout }
-          );
-          log(`  ⏳ Waited for text: ${text}`, 'dim');
-        }
-        return { success: true };
-      } catch (error) {
-        return { success: false, error: String(error) };
-      }
-    },
-  }),
-
-  browserConsole: tool({
-    description: 'Get console messages from the browser',
-    inputSchema: z.object({}),
-    execute: async () => {
-      try {
-        const page = await getBrowserPage();
-        const messages: { type: string; text: string }[] = [];
-        // Listen for new messages briefly
-        page.on('console', (msg: { type: () => string; text: () => string }) => {
-          messages.push({ type: msg.type(), text: msg.text() });
-        });
-        await new Promise(resolve => setTimeout(resolve, 100));
-        log(`  📋 Got ${messages.length} console messages`, 'dim');
-        return { success: true, messages: messages.slice(0, 50) };
-      } catch (error) {
-        return { success: false, error: String(error) };
-      }
-    },
-  }),
-
-  browserClose: tool({
-    description: 'Close the browser',
-    inputSchema: z.object({}),
-    execute: async () => {
-      await closeBrowser();
-      log(`  🔒 Browser closed`, 'dim');
-      return { success: true };
-    },
-  }),
-};
-
-type Tools = typeof tools;
-
-// Read-only tools for the judge agent
-const judgeTools = {
-  listFiles: tool({
-    description: 'List files in a directory matching a glob pattern',
-    inputSchema: z.object({
-      pattern: z.string().describe('Glob pattern like "**/*.js" or "src/**/*.ts"'),
-    }),
-    execute: async ({ pattern }) => {
-      try {
-        const files = await glob(pattern, { cwd: resolvedDir, nodir: true });
-        return { success: true, files: files.slice(0, 100) };
-      } catch (error) {
-        return { success: false, error: String(error) };
-      }
-    },
-  }),
-
-  readFile: tool({
-    description: 'Read the contents of a file to review changes',
-    inputSchema: z.object({
-      filePath: z.string().describe('Path to the file relative to the project root'),
-      lineStart: z.number().optional().describe('Start line (1-indexed)'),
-      lineEnd: z.number().optional().describe('End line (inclusive)'),
-    }),
-    execute: async ({ filePath, lineStart, lineEnd }) => {
-      try {
-        const fullPath = path.join(resolvedDir, filePath);
-        const content = await fs.readFile(fullPath, 'utf-8');
-        const lines = content.split('\n');
-        const totalLines = lines.length;
-        
-        if (lineStart !== undefined || lineEnd !== undefined) {
-          const start = Math.max(1, lineStart ?? 1);
-          const end = Math.min(totalLines, lineEnd ?? totalLines);
-          const selectedLines = lines.slice(start - 1, end);
-          return { 
-            success: true, 
-            content: selectedLines.join('\n'),
-            totalLines,
-          };
-        }
-        
-        // Truncate for judge
-        if (content.length > 15000) {
-          return { 
-            success: true, 
-            content: content.slice(0, 15000) + '\n... [truncated]',
-            totalLines,
-            truncated: true,
-          };
-        }
-        
-        return { success: true, content, totalLines };
-      } catch (error) {
-        return { success: false, error: String(error) };
-      }
-    },
-  }),
-
-  runCommand: tool({
-    description: 'Run a command to verify the code (e.g., tests, type-check, lint)',
-    inputSchema: z.object({
-      command: z.string().describe('The shell command to run'),
-    }),
-    execute: async ({ command }) => {
-      try {
-        const { stdout, stderr } = await execAsync(command, {
-          cwd: resolvedDir,
-          timeout: 60000,
-        });
-        return { success: true, output: (stdout + stderr).slice(0, 5000) };
-      } catch (error: any) {
-        return {
-          success: false,
-          error: error.message,
-          stdout: error.stdout?.slice(0, 2000),
-          stderr: error.stderr?.slice(0, 2000),
-        };
-      }
-    },
-  }),
-
-  approveTask: tool({
-    description: 'Approve the task as complete - all success criteria are met',
-    inputSchema: z.object({
-      reason: z.string().describe('Why the task is complete and meets all criteria'),
-    }),
-    execute: async ({ reason }) => {
-      return { approved: true, reason };
-    },
-  }),
-
-  requestChanges: tool({
-    description: 'Request changes - the task is NOT complete or has issues',
-    inputSchema: z.object({
-      issues: z.array(z.string()).describe('List of specific issues that need to be fixed'),
-      suggestions: z.array(z.string()).describe('Specific suggestions for the coding agent'),
-    }),
-    execute: async ({ issues, suggestions }) => {
-      return { approved: false, issues, suggestions };
-    },
-  }),
-
-  // Browser tools for testing verification
-  browserNavigate: tool({
-    description: 'Navigate the browser to a URL to test the application',
-    inputSchema: z.object({
-      url: z.string().describe('URL to navigate to'),
-    }),
-    execute: async ({ url }) => {
-      try {
-        const page = await getBrowserPage();
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-        return { success: true, url: page.url(), title: await page.title() };
-      } catch (error) {
-        return { success: false, error: String(error) };
-      }
-    },
-  }),
-
-  browserSnapshot: tool({
-    description: 'Get a text representation of the current page structure',
-    inputSchema: z.object({}),
-    execute: async () => {
-      try {
-        const page = await getBrowserPage();
-        const snapshot = await page.evaluate(() => {
-          const extractStructure = (el: Element, depth = 0): string => {
-            if (depth > 4) return '';
-            const tag = el.tagName.toLowerCase();
-            const text = el.textContent?.trim().slice(0, 50) || '';
-            const role = el.getAttribute('role') || '';
-            const lines: string[] = [];
-            
-            if (['script', 'style', 'noscript'].includes(tag)) return '';
-            
-            const indent = '  '.repeat(depth);
-            let info = `${indent}<${tag}`;
-            if (role) info += ` role="${role}"`;
-            if (text && !el.children.length) info += `>${text}</${tag}>`;
-            else info += '>';
-            lines.push(info);
-            
-            for (const child of el.children) {
-              const childStr = extractStructure(child, depth + 1);
-              if (childStr) lines.push(childStr);
-            }
-            return lines.join('\n');
-          };
-          return extractStructure(document.body);
-        });
-        return { success: true, snapshot: snapshot.slice(0, 15000) };
-      } catch (error) {
-        return { success: false, error: String(error) };
-      }
-    },
-  }),
-
-  browserClick: tool({
-    description: 'Click an element on the page',
-    inputSchema: z.object({
-      selector: z.string().describe('CSS selector or text content to click'),
-    }),
-    execute: async ({ selector }) => {
-      try {
-        const page = await getBrowserPage();
+    readFile: tool({
+      description: 'Read the contents of a file. For large files, use lineStart/lineEnd to read specific sections.',
+      inputSchema: z.object({
+        filePath: z.string().describe('Path to the file'),
+        lineStart: z.number().optional().describe('Start line (1-indexed). Use for large files.'),
+        lineEnd: z.number().optional().describe('End line (inclusive). Use for large files.'),
+      }),
+      execute: async ({ filePath, lineStart, lineEnd }) => {
         try {
-          await page.click(selector, { timeout: 5000 });
-        } catch {
-          await page.getByText(selector).click({ timeout: 5000 });
+          const content = await readFromSandbox(filePath);
+          if (!content) {
+            return { success: false, error: 'File not found' };
+          }
+          
+          const lines = content.split('\n');
+          const totalLines = lines.length;
+          
+          // If specific range requested, extract it
+          if (lineStart !== undefined || lineEnd !== undefined) {
+            const start = Math.max(1, lineStart ?? 1);
+            const end = Math.min(totalLines, lineEnd ?? totalLines);
+            const selectedLines = lines.slice(start - 1, end);
+            const numberedContent = selectedLines
+              .map((line, i) => `${String(start + i).padStart(6)}| ${line}`)
+              .join('\n');
+            log(`  📖 Read: ${filePath} lines ${start}-${end} of ${totalLines}`, 'dim');
+            return { 
+              success: true, 
+              content: numberedContent,
+              totalLines,
+              lineRange: { start, end },
+            };
+          }
+          
+          // Auto-truncate large files
+          if (content.length > MAX_FILE_CHARS) {
+            const maxLines = Math.min(MAX_FILE_LINES_PREVIEW, totalLines);
+            const selectedLines = lines.slice(0, maxLines);
+            const numberedContent = selectedLines
+              .map((line, i) => `${String(i + 1).padStart(6)}| ${line}`)
+              .join('\n');
+            const warning = `\n\n... [TRUNCATED: File has ${totalLines} lines, showing 1-${maxLines}. Use lineStart/lineEnd to read specific sections] ...`;
+            log(`  📖 Read: ${filePath} (TRUNCATED: ${totalLines} lines, showing 1-${maxLines})`, 'yellow');
+            return { 
+              success: true, 
+              content: numberedContent + warning,
+              totalLines,
+              truncated: true,
+              lineRange: { start: 1, end: maxLines },
+            };
+          }
+          
+          log(`  📖 Read: ${filePath} (${content.length} chars)`, 'dim');
+          return { success: true, content, totalLines };
+        } catch (error) {
+          return { success: false, error: String(error) };
         }
-        return { success: true };
-      } catch (error) {
-        return { success: false, error: String(error) };
-      }
-    },
-  }),
-
-  browserGetContent: tool({
-    description: 'Get the text content of the page or a specific element',
-    inputSchema: z.object({
-      selector: z.string().optional().describe('CSS selector (omit for full page)'),
+      },
     }),
-    execute: async ({ selector }) => {
-      try {
-        const page = await getBrowserPage();
-        let content: string;
-        if (selector) {
-          content = await page.locator(selector).textContent() || '';
-        } else {
-          content = await page.evaluate(() => document.body.innerText);
+
+    writeFile: tool({
+      description: 'Write content to a file (creates directories if needed). For small changes, prefer editFile instead.',
+      inputSchema: z.object({
+        filePath: z.string().describe('Path to the file'),
+        content: z.string().describe('The content to write to the file'),
+      }),
+      execute: async ({ filePath, content }) => {
+        try {
+          // Create parent directory if needed
+          const dir = path.dirname(filePath);
+          if (dir && dir !== '.') {
+            await runInSandbox(`mkdir -p "${dir}"`);
+          }
+          await writeToSandbox(filePath, content);
+          log(`  ✏️  Wrote: ${filePath}`, 'green');
+          return { success: true, filePath };
+        } catch (error) {
+          return { success: false, error: String(error) };
         }
-        return { success: true, content: content.slice(0, 10000) };
-      } catch (error) {
-        return { success: false, error: String(error) };
-      }
-    },
-  }),
-
-  browserScreenshot: tool({
-    description: 'Take a screenshot of the current page to verify UI',
-    inputSchema: z.object({
-      filename: z.string().describe('Filename for the screenshot'),
-      fullPage: z.boolean().optional().describe('Capture full scrollable page'),
+      },
     }),
-    execute: async ({ filename, fullPage }) => {
-      try {
-        const page = await getBrowserPage();
-        const screenshotPath = path.join(resolvedDir, filename);
-        await page.screenshot({ path: screenshotPath, fullPage: fullPage ?? false });
-        return { success: true, path: screenshotPath };
-      } catch (error) {
-        return { success: false, error: String(error) };
-      }
-    },
-  }),
 
-  browserWait: tool({
-    description: 'Wait for a condition on the page',
-    inputSchema: z.object({
-      selector: z.string().optional().describe('Wait for this selector'),
-      text: z.string().optional().describe('Wait for this text'),
-      timeout: z.number().optional().describe('Max wait time in ms'),
-    }),
-    execute: async ({ selector, text, timeout }) => {
-      try {
-        const page = await getBrowserPage();
-        const waitTimeout = timeout ?? 5000;
-        if (selector) {
-          await page.waitForSelector(selector, { timeout: waitTimeout });
-        } else if (text) {
-          await page.waitForFunction(
-            (t: string) => document.body.innerText.includes(t),
-            text,
-            { timeout: waitTimeout }
-          );
+    editFile: tool({
+      description: 'Make surgical edits to a file by replacing specific text. More token-efficient than writeFile for small changes. The old_string must be unique in the file.',
+      inputSchema: z.object({
+        filePath: z.string().describe('Path to the file'),
+        old_string: z.string().describe('Exact text to find and replace (must be unique in the file)'),
+        new_string: z.string().describe('Text to replace it with'),
+      }),
+      execute: async ({ filePath, old_string, new_string }) => {
+        try {
+          const content = await readFromSandbox(filePath);
+          if (!content) {
+            return { success: false, error: 'File not found' };
+          }
+          
+          // Check for exact match
+          const occurrences = content.split(old_string).length - 1;
+          if (occurrences === 0) {
+            return { 
+              success: false, 
+              error: 'old_string not found in file. Make sure it matches exactly (including whitespace).',
+            };
+          }
+          if (occurrences > 1) {
+            return { 
+              success: false, 
+              error: `old_string found ${occurrences} times - must be unique. Add more surrounding context to make it unique.`,
+            };
+          }
+          
+          // Perform replacement
+          const newContent = content.replace(old_string, new_string);
+          await writeToSandbox(filePath, newContent);
+          
+          log(`  🔧 Edited: ${filePath}`, 'green');
+          return { 
+            success: true, 
+            filePath,
+            replaced: old_string.length > 100 ? old_string.slice(0, 100) + '...' : old_string,
+            with: new_string.length > 100 ? new_string.slice(0, 100) + '...' : new_string,
+          };
+        } catch (error) {
+          return { success: false, error: String(error) };
         }
-        return { success: true };
-      } catch (error) {
-        return { success: false, error: String(error) };
-      }
-    },
-  }),
-};
+      },
+    }),
+
+    deleteFile: tool({
+      description: 'Delete a file',
+      inputSchema: z.object({
+        filePath: z.string().describe('Path to the file'),
+      }),
+      execute: async ({ filePath }) => {
+        try {
+          await runInSandbox(`rm -f "${filePath}"`);
+          log(`  🗑️  Deleted: ${filePath}`, 'yellow');
+          return { success: true, filePath };
+        } catch (error) {
+          return { success: false, error: String(error) };
+        }
+      },
+    }),
+
+    runCommand: tool({
+      description: 'Run a shell command in the sandbox',
+      inputSchema: z.object({
+        command: z.string().describe('The shell command to run'),
+      }),
+      execute: async ({ command }) => {
+        try {
+          log(`  🔧 Running: ${command}`, 'blue');
+          const result = await runInSandbox(command);
+          const output = result.stdout + (result.stderr ? `\nSTDERR: ${result.stderr}` : '');
+          
+          if (result.exitCode === 0) {
+            log(`  ✓ Command completed`, 'dim');
+          } else {
+            log(`  ✗ Command failed (exit ${result.exitCode})`, 'red');
+          }
+          
+          return { 
+            success: result.exitCode === 0, 
+            output: output.slice(0, 8000),
+            exitCode: result.exitCode,
+          };
+        } catch (error: any) {
+          log(`  ✗ Command failed`, 'red');
+          return { success: false, error: error.message };
+        }
+      },
+    }),
+
+    startDevServer: tool({
+      description: 'Start a development server in the background. Returns the URL where the app is accessible.',
+      inputSchema: z.object({
+        command: z.string().optional().describe('Custom start command (auto-detects if not provided)'),
+      }),
+      execute: async ({ command }) => {
+        try {
+          // Determine start command
+          let startCmd = command;
+          if (!startCmd) {
+            // Auto-detect
+            const pkgJson = await readFromSandbox('package.json');
+            if (pkgJson) {
+              const pkg = JSON.parse(pkgJson);
+              if (pkg.scripts?.dev) startCmd = 'npm run dev';
+              else if (pkg.scripts?.start) startCmd = 'npm run start';
+            }
+          }
+
+          if (!startCmd) {
+            return { success: false, error: 'Could not detect start command. Please provide one.' };
+          }
+
+          // Kill any existing server on port 3000
+          await runInSandbox('fuser -k 3000/tcp 2>/dev/null || true');
+          
+          // Start in background
+          const bgCmd = `nohup sh -c '${startCmd}' > /tmp/server.log 2>&1 &`;
+          await runInSandbox(bgCmd);
+          
+          // Wait a moment for server to start
+          await new Promise(resolve => setTimeout(resolve, 3000));
+          
+          log(`  🚀 Dev server starting at https://${sandboxDomain}`, 'green');
+          return { 
+            success: true, 
+            url: `https://${sandboxDomain}`,
+            command: startCmd,
+            logFile: '/tmp/server.log',
+          };
+        } catch (error) {
+          return { success: false, error: String(error) };
+        }
+      },
+    }),
+
+    curl: tool({
+      description: 'Make an HTTP request (useful for testing the dev server)',
+      inputSchema: z.object({
+        url: z.string().describe('URL to request (use localhost:3000 for the sandbox dev server)'),
+        method: z.enum(['GET', 'POST', 'PUT', 'DELETE']).optional().describe('HTTP method'),
+      }),
+      execute: async ({ url, method }) => {
+        try {
+          const resolvedUrl = url.replace('localhost:3000', sandboxDomain || 'localhost:3000');
+          const result = await runInSandbox(`curl -s -X ${method || 'GET'} "${resolvedUrl}"`);
+          return { success: true, response: result.stdout.slice(0, 5000) };
+        } catch (error) {
+          return { success: false, error: String(error) };
+        }
+      },
+    }),
+
+    markComplete: tool({
+      description: 'Mark the task as complete with a summary of what was done',
+      inputSchema: z.object({
+        summary: z.string().describe('Summary of what was accomplished'),
+        filesModified: z.array(z.string()).describe('List of files that were modified'),
+      }),
+      execute: async ({ summary, filesModified }) => {
+        log(`  ✅ Task marked complete`, 'green');
+        return { complete: true, summary, filesModified };
+      },
+    }),
+  };
+}
+
+type CodingTools = ReturnType<typeof createCodingAgentTools>;
+
+/**
+ * Create tools for the judge agent (read-only sandbox access)
+ */
+function createJudgeTools() {
+  return {
+    listFiles: tool({
+      description: 'List files in the sandbox',
+      inputSchema: z.object({
+        pattern: z.string().describe('Pattern like "**/*.js" or "src/"'),
+      }),
+      execute: async ({ pattern }) => {
+        try {
+          const result = await runInSandbox(`find . -type f -path "*${pattern}*" | grep -v node_modules | grep -v .git | head -100`);
+          const files = result.stdout.split('\n').filter(f => f.trim()).map(f => f.replace(/^\.\//, ''));
+          return { success: true, files };
+        } catch (error) {
+          return { success: false, error: String(error) };
+        }
+      },
+    }),
+
+    readFile: tool({
+      description: 'Read the contents of a file to review changes',
+      inputSchema: z.object({
+        filePath: z.string().describe('Path to the file'),
+        lineStart: z.number().optional().describe('Start line (1-indexed)'),
+        lineEnd: z.number().optional().describe('End line (inclusive)'),
+      }),
+      execute: async ({ filePath, lineStart, lineEnd }) => {
+        try {
+          const content = await readFromSandbox(filePath);
+          if (!content) {
+            return { success: false, error: 'File not found' };
+          }
+          
+          const lines = content.split('\n');
+          const totalLines = lines.length;
+          
+          if (lineStart !== undefined || lineEnd !== undefined) {
+            const start = Math.max(1, lineStart ?? 1);
+            const end = Math.min(totalLines, lineEnd ?? totalLines);
+            const selectedLines = lines.slice(start - 1, end);
+            return { success: true, content: selectedLines.join('\n'), totalLines };
+          }
+          
+          // Truncate for judge
+          if (content.length > 15000) {
+            return { 
+              success: true, 
+              content: content.slice(0, 15000) + '\n... [truncated]',
+              totalLines,
+              truncated: true,
+            };
+          }
+          
+          return { success: true, content, totalLines };
+        } catch (error) {
+          return { success: false, error: String(error) };
+        }
+      },
+    }),
+
+    runCommand: tool({
+      description: 'Run a command to verify the code (e.g., tests, type-check, lint)',
+      inputSchema: z.object({
+        command: z.string().describe('The shell command to run'),
+      }),
+      execute: async ({ command }) => {
+        try {
+          const result = await runInSandbox(command);
+          return { 
+            success: result.exitCode === 0, 
+            output: (result.stdout + result.stderr).slice(0, 5000),
+            exitCode: result.exitCode,
+          };
+        } catch (error: any) {
+          return { success: false, error: error.message };
+        }
+      },
+    }),
+
+    curl: tool({
+      description: 'Test the running dev server',
+      inputSchema: z.object({
+        path: z.string().optional().describe('Path to request (e.g., "/api/health")'),
+      }),
+      execute: async ({ path }) => {
+        try {
+          const url = `https://${sandboxDomain}${path || '/'}`;
+          const result = await runInSandbox(`curl -s "${url}"`);
+          return { success: true, response: result.stdout.slice(0, 5000) };
+        } catch (error) {
+          return { success: false, error: String(error) };
+        }
+      },
+    }),
+
+    approveTask: tool({
+      description: 'Approve the task as complete - all success criteria are met',
+      inputSchema: z.object({
+        reason: z.string().describe('Why the task is complete and meets all criteria'),
+      }),
+      execute: async ({ reason }) => {
+        return { approved: true, reason };
+      },
+    }),
+
+    requestChanges: tool({
+      description: 'Request changes - the task is NOT complete or has issues',
+      inputSchema: z.object({
+        issues: z.array(z.string()).describe('List of specific issues that need to be fixed'),
+        suggestions: z.array(z.string()).describe('Specific suggestions for the coding agent'),
+      }),
+      execute: async ({ issues, suggestions }) => {
+        return { approved: false, issues, suggestions };
+      },
+    }),
+  };
+}
 
 /**
  * Run the judge agent to review the work done.
@@ -1209,6 +1147,7 @@ async function runJudge(
   log('  🧑‍⚖️  Judge reviewing...', 'cyan');
 
   try {
+    const judgeTools = createJudgeTools();
     const result = await generateText({
       model: 'anthropic/claude-opus-4.5' as any,
       tools: judgeTools,
@@ -1277,7 +1216,7 @@ Run verification commands (type-check, build) and give your verdict.`,
       }
     }
 
-    // No verdict tool was called - this is the problem!
+    // No verdict tool was called
     log('  ⚠️  Judge did NOT call approveTask or requestChanges!', 'red');
     log(`     Final text: ${result.text.slice(0, 200)}...`, 'dim');
     
@@ -1294,7 +1233,6 @@ Run verification commands (type-check, build) and give your verdict.`,
 }
 
 // Track completion
-let taskComplete = false;
 let taskSummary = '';
 let pendingJudgeReview = false;
 let lastFilesModified: string[] = [];
@@ -1302,9 +1240,10 @@ let lastFilesModified: string[] = [];
 async function main() {
   log('╔════════════════════════════════════════════════════════════╗', 'magenta');
   log('║      Ralph Wiggum CLI Example - Autonomous Coding Agent    ║', 'magenta');
+  log('║                  🔒 Secure Sandbox Mode 🔒                  ║', 'magenta');
   log('╚════════════════════════════════════════════════════════════╝', 'magenta');
 
-  // Check if directory exists, offer to create if not
+  // Check if local directory exists, offer to create if not
   try {
     await fs.access(resolvedDir);
   } catch {
@@ -1325,22 +1264,30 @@ async function main() {
   }
 
   logSection('Configuration');
-  log(`Target: ${resolvedDir}`, 'bright');
+  log(`Local target: ${resolvedDir}`, 'bright');
+  log(`⚠️  All code runs in an isolated sandbox`, 'yellow');
+  log(`   Changes will be copied back when complete`, 'dim');
+
+  // Initialize sandbox and copy files
+  logSection('Sandbox Setup');
+  await initializeSandbox();
+
+  // Load AGENTS.md if it exists
+  let agentsMd = '';
+  try {
+    const content = await readFromSandbox('AGENTS.md');
+    if (content) {
+      agentsMd = content;
+      log(`Found AGENTS.md`, 'dim');
+    }
+  } catch {
+    // No AGENTS.md, that's fine
+  }
 
   // Get the task prompt (may run interactive interview)
   const { prompt: taskPrompt, source: promptSource } = await getTaskPrompt();
 
   log(`Prompt source: ${promptSource}`, 'dim');
-
-  // Load AGENTS.md if it exists in the target directory
-  let agentsMd = '';
-  const agentsMdPath = path.join(resolvedDir, 'AGENTS.md');
-  try {
-    agentsMd = await fs.readFile(agentsMdPath, 'utf-8');
-    log(`Found AGENTS.md`, 'dim');
-  } catch {
-    // No AGENTS.md, that's fine
-  }
   
   logSection('Task');
   // Show first 500 chars of prompt, or full if shorter
@@ -1360,11 +1307,14 @@ async function main() {
 
   if (!confirmed) {
     log('Cancelled.', 'yellow');
+    await closeSandbox();
     process.exit(0);
   }
 
   // Build instructions with optional AGENTS.md
   const baseInstructions = `You are an expert software engineer. Your task is to complete coding tasks autonomously.
+
+All your work happens in an isolated sandbox environment. You have full access to modify files and run commands.
 
 ## Guidelines:
 1. First, explore the codebase to understand its structure (list files, read key files like package.json, README, etc.)
@@ -1386,12 +1336,15 @@ Then use that exact version. NEVER guess or use outdated versions.
 - For LARGE FILES, use lineStart/lineEnd in readFile to read specific sections
 - Run tests frequently to catch issues early
 - Be thorough but efficient
+- You can start a dev server with startDevServer and test it with curl
 
-Current working directory: ${resolvedDir}`;
+Sandbox dev server URL: https://${sandboxDomain}`;
 
   const instructions = agentsMd 
     ? `${baseInstructions}\n\n## Project-Specific Instructions (from AGENTS.md)\n\n${agentsMd}`
     : baseInstructions;
+
+  const tools = createCodingAgentTools();
 
   const agent = new RalphLoopAgent({
     model: 'anthropic/claude-opus-4.5' as any,
@@ -1411,7 +1364,7 @@ Current working directory: ${resolvedDir}`;
 
     stopWhen: iterationCountIs(20),
 
-    verifyCompletion: async ({ result, originalPrompt }: VerifyCompletionContext<Tools>) => {
+    verifyCompletion: async ({ result, originalPrompt }: VerifyCompletionContext<CodingTools>) => {
       // Check if markComplete was called
       for (const step of result.steps) {
         for (const toolResult of step.toolResults) {
@@ -1439,7 +1392,6 @@ Current working directory: ${resolvedDir}`;
         );
 
         if (judgeResult.approved) {
-          taskComplete = true;
           log('  📤 Task approved by judge!', 'green');
           return {
             complete: true,
@@ -1477,6 +1429,7 @@ Current working directory: ${resolvedDir}`;
 
   logSection('Starting Task');
   log('The agent will iterate until the task is complete...', 'dim');
+  log(`Dev server URL: https://${sandboxDomain}`, 'blue');
 
   const startTime = Date.now();
 
@@ -1503,10 +1456,10 @@ Current working directory: ${resolvedDir}`;
   } catch (error) {
     logSection('Error');
     console.error(error);
-    await closeBrowser();
+    await closeSandbox();
     process.exit(1);
   } finally {
-    await closeBrowser();
+    await closeSandbox();
   }
 }
 
