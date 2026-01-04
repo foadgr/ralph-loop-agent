@@ -183,7 +183,7 @@ Generate 3 specific suggestions:`,
 }
 
 /**
- * Create a multi-selection prompt with AI-generated options + "Other".
+ * Create a multi-selection prompt with AI-generated options + "Other" + "Skip".
  */
 async function selectWithAI(
   message: string,
@@ -197,6 +197,7 @@ async function selectWithAI(
   const choices = [
     ...suggestions.map(s => ({ title: s, value: s })),
     { title: '✏️  Other (add custom)', value: '__other__' },
+    { title: '⏭️  Skip this question', value: '__skip__' },
   ];
 
   const { selections } = await prompts({
@@ -208,7 +209,12 @@ async function selectWithAI(
     instructions: false,
   }, { onCancel });
 
-  const results: string[] = selections?.filter((s: string) => s !== '__other__') || [];
+  // If skip was selected, return empty
+  if (selections?.includes('__skip__')) {
+    return '';
+  }
+
+  const results: string[] = selections?.filter((s: string) => s !== '__other__' && s !== '__skip__') || [];
 
   // If "Other" was selected, prompt for custom input
   if (selections?.includes('__other__')) {
@@ -216,22 +222,15 @@ async function selectWithAI(
       type: 'text',
       name: 'custom',
       message: 'Add your own:',
-      validate: (v: string) => v.length > 0 || 'Please enter something',
     }, { onCancel });
     if (custom) {
       results.push(custom);
     }
   }
 
-  // If nothing selected, require at least one
+  // If nothing selected, that's okay - return empty
   if (results.length === 0) {
-    const { custom } = await prompts({
-      type: 'text',
-      name: 'custom',
-      message: 'Please enter at least one:',
-      validate: (v: string) => v.length > 0 || 'Required',
-    }, { onCancel });
-    return custom;
+    return '';
   }
 
   return results.join('. ');
@@ -858,12 +857,24 @@ async function main() {
   log('║      Ralph Wiggum CLI Example - Autonomous Coding Agent    ║', 'magenta');
   log('╚════════════════════════════════════════════════════════════╝', 'magenta');
 
-  // Verify directory exists
+  // Check if directory exists, offer to create if not
   try {
     await fs.access(resolvedDir);
   } catch {
-    log(`Error: Directory does not exist: ${resolvedDir}`, 'red');
-    process.exit(1);
+    const { createDir } = await prompts({
+      type: 'confirm',
+      name: 'createDir',
+      message: `Directory does not exist: ${resolvedDir}\n  Create it?`,
+      initial: true,
+    });
+
+    if (!createDir) {
+      log('Cancelled.', 'yellow');
+      process.exit(0);
+    }
+
+    await fs.mkdir(resolvedDir, { recursive: true });
+    log(`✓ Created ${resolvedDir}`, 'green');
   }
 
   logSection('Configuration');
