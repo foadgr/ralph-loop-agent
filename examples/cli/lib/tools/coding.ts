@@ -394,8 +394,10 @@ export function createCodingAgentTools() {
       }),
       execute: async ({ url, outputPath, fullPage, analyze = true, question }) => {
         try {
-          const targetUrl = url?.replace('localhost:3000', sandboxDomain || 'localhost:3000') 
-            || `https://${sandboxDomain}`;
+          // sandboxDomain already includes https://
+          const baseUrl = sandboxDomain?.startsWith('https://') ? sandboxDomain : `https://${sandboxDomain}`;
+          const targetUrl = url?.replace('localhost:3000', baseUrl?.replace('https://', '') || 'localhost:3000') 
+            || baseUrl;
           const output = outputPath || '/tmp/screenshot.png';
           const fullPageOpt = fullPage ? 'fullPage: true,' : '';
           
@@ -511,8 +513,9 @@ Be concise but thorough.`;
       }),
       execute: async ({ action, url, selector, text, waitForSelector, screenshotAfter = true }) => {
         try {
-          const baseUrl = `https://${sandboxDomain}`;
-          const targetUrl = url?.replace('localhost:3000', sandboxDomain || 'localhost:3000') || baseUrl;
+          // sandboxDomain already includes https://
+          const baseUrl = sandboxDomain?.startsWith('https://') ? sandboxDomain : `https://${sandboxDomain}`;
+          const targetUrl = url?.replace('localhost:3000', baseUrl?.replace('https://', '') || 'localhost:3000') || baseUrl;
           
           log(`  [>] Browser: ${action}${selector ? ` on "${selector}"` : ''}${url ? ` to ${url}` : ''}`, 'blue');
           

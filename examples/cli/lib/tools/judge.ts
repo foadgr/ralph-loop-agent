@@ -23,8 +23,10 @@ export function createJudgeTools() {
       }),
       execute: async ({ url, outputPath, fullPage }) => {
         try {
-          const targetUrl = url?.replace('localhost:3000', sandboxDomain || 'localhost:3000') 
-            || `https://${sandboxDomain}`;
+          // sandboxDomain already includes https://
+          const baseUrl = sandboxDomain?.startsWith('https://') ? sandboxDomain : `https://${sandboxDomain}`;
+          const targetUrl = url?.replace('localhost:3000', baseUrl?.replace('https://', '') || 'localhost:3000') 
+            || baseUrl;
           const output = outputPath || '/tmp/judge-screenshot.png';
           const fullPageOpt = fullPage ? 'fullPage: true,' : '';
           
@@ -100,8 +102,9 @@ export function createJudgeTools() {
       }),
       execute: async ({ action, url, selector, text, timeout }) => {
         try {
-          const baseUrl = `https://${sandboxDomain}`;
-          const targetUrl = url?.replace('localhost:3000', sandboxDomain || 'localhost:3000') || baseUrl;
+          // sandboxDomain already includes https://
+          const baseUrl = sandboxDomain?.startsWith('https://') ? sandboxDomain : `https://${sandboxDomain}`;
+          const targetUrl = url?.replace('localhost:3000', baseUrl?.replace('https://', '') || 'localhost:3000') || baseUrl;
           const timeoutMs = timeout || 5000;
           
           log(`  [judge] Browser: ${action}${selector ? ` on ${selector}` : ''}${url ? ` to ${targetUrl}` : ''}`, 'blue');
