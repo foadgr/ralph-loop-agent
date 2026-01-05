@@ -290,7 +290,7 @@ Generate the revised plan.`,
 async function showInterruptMenu(): Promise<'continue' | 'followup' | 'save' | 'quit'> {
   console.log('\n');
   log('  ╔═══════════════════════════════════════╗', 'yellow');
-  log('  ║           INTERRUPTED (Ctrl+C)         ║', 'yellow');
+  log('  ║          INTERRUPTED (Ctrl+C)         ║', 'yellow');
   log('  ╚═══════════════════════════════════════╝', 'yellow');
   log('  Press Ctrl+C again to force quit\n', 'dim');
   

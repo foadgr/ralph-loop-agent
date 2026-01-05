@@ -443,7 +443,7 @@ async function copyLocalToSandbox(localDir: string): Promise<void> {
         // .NET
         'bin',
         'obj',
-        'packages',
+        // Note: 'packages' is NOT skipped - commonly used for monorepo source code
         // PHP
         'vendor',
         // iOS/macOS
@@ -491,7 +491,7 @@ async function copyLocalToSandbox(localDir: string): Promise<void> {
           if (entry.isDirectory()) {
             const buildDirs = ['node_modules', '.npm', '.pnpm-store', 'venv', '.venv', '__pycache__', 
               '.pytest_cache', '.mypy_cache', '.ruff_cache', 'target', 'build', '.gradle', 'bin', 
-              'obj', 'packages', 'vendor', 'Pods', 'DerivedData', '.bundle', '.cache', 'dist', 
+              'obj', 'vendor', 'Pods', 'DerivedData', '.bundle', '.cache', 'dist', 
               '.next', '.nuxt', '.output', '.turbo'];
             if (buildDirs.includes(entry.name)) {
               skippedBuildDirs.push(sandboxPath);
@@ -688,7 +688,7 @@ async function copySandboxToLocal(localDir: string): Promise<void> {
         } else {
           // Text file - write as UTF-8
           const content = await streamToString(stream);
-          await fs.writeFile(localPath, content, 'utf-8');
+        await fs.writeFile(localPath, content, 'utf-8');
         }
         copiedCount++;
       }
