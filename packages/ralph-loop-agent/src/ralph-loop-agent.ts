@@ -286,9 +286,11 @@ export class RalphLoopAgent<TOOLS extends ToolSet = {}> {
               lastSystem.content += contextInjection;
             }
           } else {
+            // Enable Anthropic prompt caching on injected context
             messagesToSend.unshift({
               role: 'system',
               content: contextInjection,
+              providerOptions: { anthropic: { cacheControl: { type: 'ephemeral' } } },
             });
           }
         }
@@ -609,6 +611,7 @@ export class RalphLoopAgent<TOOLS extends ToolSet = {}> {
 
   /**
    * Build system messages from instructions.
+   * Enables Anthropic prompt caching for cost reduction.
    */
   private buildSystemMessages(): Array<ModelMessage> {
     const { instructions } = this.settings;
@@ -617,14 +620,21 @@ export class RalphLoopAgent<TOOLS extends ToolSet = {}> {
       return [];
     }
 
+    // Enable Anthropic prompt caching on system messages
+    const cacheControl = { anthropic: { cacheControl: { type: 'ephemeral' } } };
+
     if (typeof instructions === 'string') {
-      return [{ role: 'system', content: instructions }];
+      return [{ role: 'system', content: instructions, providerOptions: cacheControl }];
     }
 
     if (Array.isArray(instructions)) {
-      return instructions;
+      // Add cacheControl to each message that doesn't already have it
+      return instructions.map(msg => ({
+        ...msg,
+        providerOptions: msg.providerOptions ?? cacheControl,
+      }));
     }
 
-    return [instructions];
+    return [{ ...instructions, providerOptions: instructions.providerOptions ?? cacheControl }];
   }
 }
