@@ -120,6 +120,9 @@ async function main() {
 
   const promptResult = await getTaskPrompt(promptArg, resolvedDir);
 
+  // Track if user already confirmed via Plan Mode approval
+  let alreadyConfirmed = false;
+
   if ('needsInterview' in promptResult) {
     // Interview mode needs sandbox for codebase exploration
     // Create sandbox first, then run interview
@@ -130,6 +133,8 @@ async function main() {
     const interviewResult = await runInterviewAndGetPrompt();
     taskPrompt = interviewResult.prompt;
     promptSource = interviewResult.source;
+    // User already approved in Plan Mode, no need to ask again
+    alreadyConfirmed = true;
   } else {
     taskPrompt = promptResult.prompt;
     promptSource = promptResult.source;
@@ -144,21 +149,23 @@ async function main() {
     : taskPrompt;
   log(promptPreview, 'bright');
 
-  // Confirm before starting
-  console.log();
-  const { confirmed } = await prompts({
-    type: 'confirm',
-    name: 'confirmed',
-    message: 'Start the agent?',
-    initial: true,
-  });
+  // Only ask for confirmation if we didn't already get approval via Plan Mode
+  if (!alreadyConfirmed) {
+    console.log();
+    const { confirmed } = await prompts({
+      type: 'confirm',
+      name: 'confirmed',
+      message: 'Start the agent?',
+      initial: true,
+    });
 
-  if (!confirmed) {
-    log('Cancelled.', 'yellow');
-    if (sandboxCreatedForInterview) {
-      await closeSandbox(resolvedDir);
+    if (!confirmed) {
+      log('Cancelled.', 'yellow');
+      if (sandboxCreatedForInterview) {
+        await closeSandbox(resolvedDir);
+      }
+      process.exit(0);
     }
-    process.exit(0);
   }
 
   // Create sandbox if not already created (for interview mode)

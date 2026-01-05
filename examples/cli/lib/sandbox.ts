@@ -109,6 +109,173 @@ export async function initializeSandbox(localDir: string): Promise<void> {
 
   // Copy files from local directory to sandbox
   await copyLocalToSandbox(localDir);
+
+  // Install development tools in parallel
+  await installDevTools();
+}
+
+/**
+ * Install development tools in the sandbox (Playwright, PostgreSQL, Redis)
+ */
+async function installDevTools(): Promise<void> {
+  log('  [-] Installing dev tools (Playwright, PostgreSQL, Redis)...', 'cyan');
+  
+  // Run installations in parallel for speed
+  const [playwrightResult, postgresResult, redisResult] = await Promise.all([
+    installPlaywright(),
+    installPostgres(),
+    installRedis(),
+  ]);
+
+  // Log results
+  if (playwrightResult) log('  [+] Playwright installed with Chromium', 'green');
+  else log('  [!] Playwright installation failed', 'yellow');
+  
+  if (postgresResult) log('  [+] PostgreSQL 16 installed and running', 'green');
+  else log('  [!] PostgreSQL installation failed', 'yellow');
+  
+  if (redisResult) log('  [+] Redis installed and running', 'green');
+  else log('  [!] Redis installation failed', 'yellow');
+}
+
+/**
+ * Install Playwright globally in the sandbox for browser testing
+ */
+async function installPlaywright(): Promise<boolean> {
+  const PLAYWRIGHT_CACHE = '/home/vercel-sandbox/.cache/ms-playwright';
+  
+  try {
+    // First, install system dependencies needed by Chromium
+    log('      Installing Chromium system dependencies...', 'dim');
+    const depsResult = await runInSandboxInternal(
+      'sudo dnf install -y nss nspr atk at-spi2-atk cups-libs libdrm libXcomposite libXdamage libXrandr mesa-libgbm alsa-lib pango 2>&1'
+    );
+    if (depsResult.exitCode !== 0) {
+      log(`      System deps install warning: ${depsResult.stdout.slice(-200)}`, 'dim');
+      // Continue anyway, some deps might already be installed
+    }
+    
+    // Install Playwright package globally
+    log('      Installing playwright globally...', 'dim');
+    const installResult = await runInSandboxInternal('npm install -g playwright@latest 2>&1');
+    if (installResult.exitCode !== 0) {
+      log(`      Playwright npm install failed: ${installResult.stdout.slice(0, 300)}`, 'dim');
+      return false;
+    }
+    log('      Playwright package installed', 'dim');
+
+    // Install Chromium with dependencies
+    log('      Installing Chromium browser...', 'dim');
+    const browserResult = await runInSandboxInternal(
+      `PLAYWRIGHT_BROWSERS_PATH=${PLAYWRIGHT_CACHE} npx playwright install --with-deps chromium 2>&1`
+    );
+    
+    // Log full output for debugging
+    if (browserResult.stdout) {
+      log(`      Browser install output: ${browserResult.stdout.slice(-300)}`, 'dim');
+    }
+    
+    if (browserResult.exitCode !== 0) {
+      log(`      Chromium install failed (exit ${browserResult.exitCode})`, 'dim');
+      // Try without --with-deps as fallback
+      log('      Retrying without --with-deps...', 'dim');
+      const retryResult = await runInSandboxInternal(
+        `PLAYWRIGHT_BROWSERS_PATH=${PLAYWRIGHT_CACHE} npx playwright install chromium 2>&1`
+      );
+      if (retryResult.exitCode !== 0) {
+        return false;
+      }
+    }
+    
+    // Verify installation - check that chromium directory exists and has content
+    const verifyResult = await runInSandboxInternal(`ls -la ${PLAYWRIGHT_CACHE}/ 2>&1`);
+    const cacheContent = verifyResult.stdout.trim();
+    log(`      Playwright cache contents: ${cacheContent.split('\n').slice(0, 3).join('; ')}`, 'dim');
+    
+    // Check if chromium was actually installed
+    const chromiumCheck = await runInSandboxInternal(`find ${PLAYWRIGHT_CACHE} -name "chrome*" -type f 2>/dev/null | head -1`);
+    if (chromiumCheck.stdout.trim()) {
+      log(`      Chromium binary found: ${chromiumCheck.stdout.trim()}`, 'dim');
+    } else {
+      log(`      Warning: Chromium binary not found in cache`, 'yellow');
+    }
+    
+    return true;
+  } catch (error: any) {
+    log(`      Playwright install exception: ${error.message}`, 'dim');
+    return false;
+  }
+}
+
+/**
+ * Install PostgreSQL in the sandbox for database testing/migrations
+ */
+async function installPostgres(): Promise<boolean> {
+  try {
+    // Install PostgreSQL 16
+    const installResult = await runInSandboxInternal('sudo dnf install -y postgresql16 postgresql16-server 2>&1');
+    if (installResult.exitCode !== 0) return false;
+
+    // Initialize the database
+    const initResult = await runInSandboxInternal('sudo postgresql-setup --initdb 2>&1 || true');
+    
+    // Start PostgreSQL service
+    const startResult = await runInSandboxInternal('sudo systemctl start postgresql 2>&1 || sudo pg_ctl -D /var/lib/pgsql/data start 2>&1 || true');
+    
+    // Create a default database for the sandbox user
+    // Wait a moment for postgres to fully start
+    await runInSandboxInternal('sleep 2');
+    await runInSandboxInternal('sudo -u postgres createuser -s $(whoami) 2>&1 || true');
+    await runInSandboxInternal('createdb sandbox 2>&1 || true');
+    
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Install Redis in the sandbox for caching/sessions
+ */
+async function installRedis(): Promise<boolean> {
+  try {
+    // Install Redis
+    const installResult = await runInSandboxInternal('sudo dnf install -y redis6 2>&1');
+    if (installResult.exitCode !== 0) return false;
+
+    // Start Redis service
+    await runInSandboxInternal('sudo systemctl start redis 2>&1 || redis-server --daemonize yes 2>&1 || true');
+    
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Internal helper to run commands before sandbox is fully exposed
+ */
+async function runInSandboxInternal(command: string): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+  const cmd = await sandbox!.runCommand({
+    cmd: 'sh',
+    args: ['-c', command],
+    detached: true,
+  });
+
+  let stdout = '';
+  let stderr = '';
+
+  try {
+    for await (const logEntry of cmd.logs()) {
+      if (logEntry.stream === 'stdout') stdout += logEntry.data;
+      if (logEntry.stream === 'stderr') stderr += logEntry.data;
+    }
+  } catch {
+    // Ignore streaming errors
+  }
+
+  const result = await cmd.wait();
+  return { stdout, stderr, exitCode: result.exitCode };
 }
 
 /**
