@@ -74,6 +74,51 @@ let taskSummary = '';
 let pendingJudgeReview = false;
 let lastFilesModified: string[] = [];
 
+// Track sandbox state for cleanup
+let sandboxInitialized = false;
+let isCleaningUp = false;
+
+// Cleanup function for all exit scenarios
+async function cleanup(exitCode: number = 0) {
+  if (isCleaningUp) return; // Prevent double cleanup
+  isCleaningUp = true;
+  
+  if (sandboxInitialized) {
+    log('\n  [~] Cleaning up sandbox...', 'yellow');
+    try {
+      await closeSandbox(resolvedDir);
+      log('  [+] Sandbox closed', 'green');
+    } catch (error) {
+      log(`  [x] Error closing sandbox: ${error}`, 'red');
+    }
+  }
+  
+  process.exit(exitCode);
+}
+
+// Handle Ctrl+C (SIGINT) and other termination signals
+process.on('SIGINT', () => {
+  log('\n\n  [!] Interrupted (Ctrl+C)', 'yellow');
+  cleanup(130); // Standard exit code for SIGINT
+});
+
+process.on('SIGTERM', () => {
+  log('\n\n  [!] Terminated', 'yellow');
+  cleanup(143); // Standard exit code for SIGTERM
+});
+
+// Handle uncaught errors
+process.on('uncaughtException', async (error) => {
+  log(`\n\n  [x] Uncaught exception: ${error.message}`, 'red');
+  console.error(error);
+  await cleanup(1);
+});
+
+process.on('unhandledRejection', async (reason) => {
+  log(`\n\n  [x] Unhandled rejection: ${reason}`, 'red');
+  await cleanup(1);
+});
+
 // Track running token usage
 let runningUsage: LanguageModelUsage = {
   inputTokens: 0,
@@ -181,6 +226,7 @@ async function main() {
   // Create sandbox now - only when the actual task begins
   logSection('Sandbox Setup');
   await initializeSandbox(resolvedDir);
+  sandboxInitialized = true;
 
   const sandboxDomain = getSandboxDomain();
 
@@ -364,11 +410,11 @@ Sandbox dev server URL: ${sandboxDomain}`;
   } catch (error) {
     logSection('Error');
     console.error(error);
-    await closeSandbox(resolvedDir);
-    process.exit(1);
-  } finally {
-    await closeSandbox(resolvedDir);
+    await cleanup(1);
   }
+  
+  // Normal completion
+  await cleanup(0);
 }
 
 main();
