@@ -14,6 +14,122 @@ const PLAYWRIGHT_CACHE = '/home/vercel-sandbox/.cache/ms-playwright';
 const GLOBAL_NODE_MODULES = '/home/vercel-sandbox/.global/npm/lib/node_modules';
 const PLAYWRIGHT_ENV = `NODE_PATH="${GLOBAL_NODE_MODULES}" PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_CACHE}"`;
 
+// Helper functions for file operations (used by both single and batch tools)
+async function readFileImpl(filePath: string, lineStart?: number, lineEnd?: number) {
+  try {
+    const content = await readFromSandbox(filePath);
+    if (!content) {
+      return { success: false, error: 'File not found' };
+    }
+    
+    const lines = content.split('\n');
+    const totalLines = lines.length;
+    
+    // If specific range requested, extract it
+    if (lineStart !== undefined || lineEnd !== undefined) {
+      const start = Math.max(1, lineStart ?? 1);
+      const end = Math.min(totalLines, lineEnd ?? totalLines);
+      const selectedLines = lines.slice(start - 1, end);
+      const numberedContent = selectedLines
+        .map((line, i) => `${String(start + i).padStart(6)}| ${line}`)
+        .join('\n');
+      log(`      Read: ${filePath} lines ${start}-${end} of ${totalLines}`, 'dim');
+      return { 
+        success: true, 
+        content: numberedContent,
+        totalLines,
+        lineRange: { start, end },
+      };
+    }
+    
+    // Auto-truncate large files
+    if (content.length > MAX_FILE_CHARS) {
+      const maxLines = Math.min(MAX_FILE_LINES_PREVIEW, totalLines);
+      const selectedLines = lines.slice(0, maxLines);
+      const numberedContent = selectedLines
+        .map((line, i) => `${String(i + 1).padStart(6)}| ${line}`)
+        .join('\n');
+      const warning = `\n\n... [TRUNCATED: File has ${totalLines} lines, showing 1-${maxLines}. Use lineStart/lineEnd to read specific sections] ...`;
+      log(`  [!] Read: ${filePath} (TRUNCATED: ${totalLines} lines, showing 1-${maxLines})`, 'yellow');
+      return { 
+        success: true, 
+        content: numberedContent + warning,
+        totalLines,
+        truncated: true,
+        lineRange: { start: 1, end: maxLines },
+      };
+    }
+    
+    log(`      Read: ${filePath} (${content.length} chars)`, 'dim');
+    return { success: true, content, totalLines };
+  } catch (error) {
+    return { success: false, error: String(error) };
+  }
+}
+
+async function writeFileImpl(filePath: string, content: string) {
+  try {
+    // Create parent directory if needed
+    const dir = path.dirname(filePath);
+    if (dir && dir !== '.') {
+      await runInSandbox(`mkdir -p "${dir}"`);
+    }
+    await writeToSandbox(filePath, content);
+    log(`  [+] Wrote: ${filePath}`, 'green');
+    return { success: true, filePath };
+  } catch (error) {
+    return { success: false, error: String(error) };
+  }
+}
+
+async function editFileImpl(filePath: string, old_string: string, new_string: string) {
+  try {
+    const content = await readFromSandbox(filePath);
+    if (!content) {
+      return { success: false, error: 'File not found' };
+    }
+    
+    // Check for exact match
+    const occurrences = content.split(old_string).length - 1;
+    if (occurrences === 0) {
+      return { 
+        success: false, 
+        error: 'old_string not found in file. Make sure it matches exactly (including whitespace).',
+      };
+    }
+    if (occurrences > 1) {
+      return { 
+        success: false, 
+        error: `old_string found ${occurrences} times - must be unique. Add more surrounding context to make it unique.`,
+      };
+    }
+    
+    // Perform replacement
+    const newContent = content.replace(old_string, new_string);
+    await writeToSandbox(filePath, newContent);
+    
+    log(`  [~] Edited: ${filePath}`, 'green');
+    return { 
+      success: true, 
+      filePath,
+      replaced: old_string.length > 100 ? old_string.slice(0, 100) + '...' : old_string,
+      with: new_string.length > 100 ? new_string.slice(0, 100) + '...' : new_string,
+    };
+  } catch (error) {
+    return { success: false, error: String(error) };
+  }
+}
+
+async function deleteFileImpl(filePath: string) {
+  try {
+    await runInSandbox(`rm -f "${filePath}"`);
+    log(`  [x] Deleted: ${filePath}`, 'yellow');
+    return { success: true, filePath };
+  } catch (error) {
+    return { success: false, error: String(error) };
+  }
+}
+
 export function createCodingAgentTools() {
   const sandboxDomain = getSandboxDomain();
 
@@ -111,146 +227,142 @@ export function createCodingAgentTools() {
     }),
 
     readFile: tool({
-      description: 'Read the contents of a file. For large files, use lineStart/lineEnd to read specific sections.',
+      description: 'Read one or more files. For large files, use lineStart/lineEnd to read specific sections.',
       inputSchema: z.object({
-        filePath: z.string().describe('Path to the file'),
-        lineStart: z.number().optional().describe('Start line (1-indexed). Use for large files.'),
-        lineEnd: z.number().optional().describe('End line (inclusive). Use for large files.'),
+        files: z.array(z.object({
+          filePath: z.string().describe('Path to the file'),
+          lineStart: z.number().optional().describe('Start line (1-indexed)'),
+          lineEnd: z.number().optional().describe('End line (inclusive)'),
+        })).describe('Array of files to read (can be just one)'),
       }),
-      execute: async ({ filePath, lineStart, lineEnd }) => {
-        try {
-          const content = await readFromSandbox(filePath);
-          if (!content) {
-            return { success: false, error: 'File not found' };
-          }
-          
-          const lines = content.split('\n');
-          const totalLines = lines.length;
-          
-          // If specific range requested, extract it
-          if (lineStart !== undefined || lineEnd !== undefined) {
-            const start = Math.max(1, lineStart ?? 1);
-            const end = Math.min(totalLines, lineEnd ?? totalLines);
-            const selectedLines = lines.slice(start - 1, end);
-            const numberedContent = selectedLines
-              .map((line, i) => `${String(start + i).padStart(6)}| ${line}`)
-              .join('\n');
-            log(`      Read: ${filePath} lines ${start}-${end} of ${totalLines}`, 'dim');
-            return { 
-              success: true, 
-              content: numberedContent,
-              totalLines,
-              lineRange: { start, end },
-            };
-          }
-          
-          // Auto-truncate large files
-          if (content.length > MAX_FILE_CHARS) {
-            const maxLines = Math.min(MAX_FILE_LINES_PREVIEW, totalLines);
-            const selectedLines = lines.slice(0, maxLines);
-            const numberedContent = selectedLines
-              .map((line, i) => `${String(i + 1).padStart(6)}| ${line}`)
-              .join('\n');
-            const warning = `\n\n... [TRUNCATED: File has ${totalLines} lines, showing 1-${maxLines}. Use lineStart/lineEnd to read specific sections] ...`;
-            log(`  [!] Read: ${filePath} (TRUNCATED: ${totalLines} lines, showing 1-${maxLines})`, 'yellow');
-            return { 
-              success: true, 
-              content: numberedContent + warning,
-              totalLines,
-              truncated: true,
-              lineRange: { start: 1, end: maxLines },
-            };
-          }
-          
-          log(`      Read: ${filePath} (${content.length} chars)`, 'dim');
-          return { success: true, content, totalLines };
-        } catch (error) {
-          return { success: false, error: String(error) };
+      execute: async ({ files }) => {
+        if (files.length === 1) {
+          const { filePath, lineStart, lineEnd } = files[0];
+          return readFileImpl(filePath, lineStart, lineEnd);
         }
+        const results = await Promise.all(
+          files.map(async ({ filePath, lineStart, lineEnd }) => {
+            const result = await readFileImpl(filePath, lineStart, lineEnd);
+            return { filePath, ...result };
+          })
+        );
+        return { success: true, files: results };
       },
     }),
 
     writeFile: tool({
-      description: 'Write content to a file (creates directories if needed). For small changes, prefer editFile instead.',
+      description: 'Write one or more files (creates directories if needed). For small changes to existing files, prefer editFile.',
       inputSchema: z.object({
-        filePath: z.string().describe('Path to the file'),
-        content: z.string().describe('The content to write to the file'),
+        files: z.array(z.object({
+          filePath: z.string().describe('Path to the file'),
+          content: z.string().describe('The content to write'),
+        })).describe('Array of files to write (can be just one)'),
       }),
-      execute: async ({ filePath, content }) => {
-        try {
-          // Create parent directory if needed
-          const dir = path.dirname(filePath);
-          if (dir && dir !== '.') {
-            await runInSandbox(`mkdir -p "${dir}"`);
-          }
-          await writeToSandbox(filePath, content);
-          log(`  [+] Wrote: ${filePath}`, 'green');
-          return { success: true, filePath };
-        } catch (error) {
-          return { success: false, error: String(error) };
+      execute: async ({ files }) => {
+        if (files.length === 1) {
+          return writeFileImpl(files[0].filePath, files[0].content);
         }
+        const results = await Promise.all(
+          files.map(async ({ filePath, content }) => {
+            const result = await writeFileImpl(filePath, content);
+            return { filePath, ...result };
+          })
+        );
+        const succeeded = results.filter(r => r.success).length;
+        const failed = results.filter(r => !r.success).length;
+        return { success: failed === 0, succeeded, failed, files: results };
       },
     }),
 
     editFile: tool({
-      description: 'Make surgical edits to a file by replacing specific text. More token-efficient than writeFile for small changes. The old_string must be unique in the file.',
+      description: 'Make one or more surgical edits by replacing specific text. More token-efficient than writeFile for small changes. Each old_string must be unique in its file. Edits to the same file are applied sequentially.',
       inputSchema: z.object({
-        filePath: z.string().describe('Path to the file'),
-        old_string: z.string().describe('Exact text to find and replace (must be unique in the file)'),
-        new_string: z.string().describe('Text to replace it with'),
+        edits: z.array(z.object({
+          filePath: z.string().describe('Path to the file'),
+          oldString: z.string().describe('Exact text to find and replace (must be unique in the file)'),
+          newString: z.string().describe('Text to replace it with'),
+        })).describe('Array of edits to make (can be just one)'),
       }),
-      execute: async ({ filePath, old_string, new_string }) => {
-        try {
-          const content = await readFromSandbox(filePath);
-          if (!content) {
-            return { success: false, error: 'File not found' };
-          }
-          
-          // Check for exact match
-          const occurrences = content.split(old_string).length - 1;
-          if (occurrences === 0) {
-            return { 
-              success: false, 
-              error: 'old_string not found in file. Make sure it matches exactly (including whitespace).',
-            };
-          }
-          if (occurrences > 1) {
-            return { 
-              success: false, 
-              error: `old_string found ${occurrences} times - must be unique. Add more surrounding context to make it unique.`,
-            };
-          }
-          
-          // Perform replacement
-          const newContent = content.replace(old_string, new_string);
-          await writeToSandbox(filePath, newContent);
-          
-          log(`  [~] Edited: ${filePath}`, 'green');
-          return { 
-            success: true, 
-            filePath,
-            replaced: old_string.length > 100 ? old_string.slice(0, 100) + '...' : old_string,
-            with: new_string.length > 100 ? new_string.slice(0, 100) + '...' : new_string,
-          };
-        } catch (error) {
-          return { success: false, error: String(error) };
+      execute: async ({ edits }) => {
+        if (edits.length === 1) {
+          return editFileImpl(edits[0].filePath, edits[0].oldString, edits[0].newString);
         }
+        
+        // Group edits by file to apply them sequentially within each file
+        const editsByFile = new Map<string, typeof edits>();
+        for (const edit of edits) {
+          const existing = editsByFile.get(edit.filePath) || [];
+          existing.push(edit);
+          editsByFile.set(edit.filePath, existing);
+        }
+        
+        const results: Array<{ filePath: string; success: boolean; error?: string }> = [];
+        
+        for (const [filePath, fileEdits] of editsByFile) {
+          // Read file once
+          let content = await readFromSandbox(filePath);
+          if (!content) {
+            for (const edit of fileEdits) {
+              results.push({ filePath, success: false, error: 'File not found' });
+            }
+            continue;
+          }
+          
+          // Apply edits sequentially
+          let allSuccess = true;
+          for (const edit of fileEdits) {
+            const occurrences = content.split(edit.oldString).length - 1;
+            if (occurrences === 0) {
+              results.push({ 
+                filePath, 
+                success: false, 
+                error: 'oldString not found in file',
+              });
+              allSuccess = false;
+            } else if (occurrences > 1) {
+              results.push({ 
+                filePath, 
+                success: false, 
+                error: `oldString found ${occurrences} times - must be unique`,
+              });
+              allSuccess = false;
+            } else {
+              content = content.replace(edit.oldString, edit.newString);
+              results.push({ filePath, success: true });
+            }
+          }
+          
+          // Write file once if any edits succeeded
+          if (allSuccess || results.some(r => r.filePath === filePath && r.success)) {
+            await writeToSandbox(filePath, content);
+            log(`  [~] Edited: ${filePath} (${fileEdits.length} changes)`, 'green');
+          }
+        }
+        
+        const succeeded = results.filter(r => r.success).length;
+        const failed = results.filter(r => !r.success).length;
+        return { success: failed === 0, succeeded, failed, edits: results };
       },
     }),
 
     deleteFile: tool({
-      description: 'Delete a file',
+      description: 'Delete one or more files.',
       inputSchema: z.object({
-        filePath: z.string().describe('Path to the file'),
+        files: z.array(z.string()).describe('Array of file paths to delete (can be just one)'),
       }),
-      execute: async ({ filePath }) => {
-        try {
-          await runInSandbox(`rm -f "${filePath}"`);
-          log(`  [x] Deleted: ${filePath}`, 'yellow');
-          return { success: true, filePath };
-        } catch (error) {
-          return { success: false, error: String(error) };
+      execute: async ({ files }) => {
+        if (files.length === 1) {
+          return deleteFileImpl(files[0]);
         }
+        const results = await Promise.all(
+          files.map(async (filePath) => {
+            const result = await deleteFileImpl(filePath);
+            return { filePath, ...result };
+          })
+        );
+        const succeeded = results.filter(r => r.success).length;
+        const failed = results.filter(r => !r.success).length;
+        return { success: failed === 0, succeeded, failed, files: results };
       },
     }),
 

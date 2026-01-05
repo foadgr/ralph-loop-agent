@@ -10,6 +10,40 @@ import { log } from '../logger.js';
 // Vision model for analyzing screenshots
 const VISION_MODEL = 'anthropic/claude-sonnet-4-20250514';
 
+// Helper function for reading files (used by both single and batch tools)
+async function readFileForJudge(filePath: string, lineStart?: number, lineEnd?: number) {
+  try {
+    const content = await readFromSandbox(filePath);
+    if (!content) {
+      return { success: false, error: 'File not found' };
+    }
+    
+    const lines = content.split('\n');
+    const totalLines = lines.length;
+    
+    if (lineStart !== undefined || lineEnd !== undefined) {
+      const start = Math.max(1, lineStart ?? 1);
+      const end = Math.min(totalLines, lineEnd ?? totalLines);
+      const selectedLines = lines.slice(start - 1, end);
+      return { success: true, content: selectedLines.join('\n'), totalLines };
+    }
+    
+    // Truncate for judge
+    if (content.length > 15000) {
+      return { 
+        success: true, 
+        content: content.slice(0, 15000) + '\n... [truncated]',
+        totalLines,
+        truncated: true,
+      };
+    }
+    
+    return { success: true, content, totalLines };
+  } catch (error) {
+    return { success: false, error: String(error) };
+  }
+}
+
 export function createJudgeTools() {
   const sandboxDomain = getSandboxDomain();
 
@@ -223,43 +257,26 @@ export function createJudgeTools() {
     }),
 
     readFile: tool({
-      description: 'Read the contents of a file to review changes',
+      description: 'Read one or more files to review changes.',
       inputSchema: z.object({
-        filePath: z.string().describe('Path to the file'),
-        lineStart: z.number().optional().describe('Start line (1-indexed)'),
-        lineEnd: z.number().optional().describe('End line (inclusive)'),
+        files: z.array(z.object({
+          filePath: z.string().describe('Path to the file'),
+          lineStart: z.number().optional().describe('Start line (1-indexed)'),
+          lineEnd: z.number().optional().describe('End line (inclusive)'),
+        })).describe('Array of files to read (can be just one)'),
       }),
-      execute: async ({ filePath, lineStart, lineEnd }) => {
-        try {
-          const content = await readFromSandbox(filePath);
-          if (!content) {
-            return { success: false, error: 'File not found' };
-          }
-          
-          const lines = content.split('\n');
-          const totalLines = lines.length;
-          
-          if (lineStart !== undefined || lineEnd !== undefined) {
-            const start = Math.max(1, lineStart ?? 1);
-            const end = Math.min(totalLines, lineEnd ?? totalLines);
-            const selectedLines = lines.slice(start - 1, end);
-            return { success: true, content: selectedLines.join('\n'), totalLines };
-          }
-          
-          // Truncate for judge
-          if (content.length > 15000) {
-            return { 
-              success: true, 
-              content: content.slice(0, 15000) + '\n... [truncated]',
-              totalLines,
-              truncated: true,
-            };
-          }
-          
-          return { success: true, content, totalLines };
-        } catch (error) {
-          return { success: false, error: String(error) };
+      execute: async ({ files }) => {
+        if (files.length === 1) {
+          const { filePath, lineStart, lineEnd } = files[0];
+          return readFileForJudge(filePath, lineStart, lineEnd);
         }
+        const results = await Promise.all(
+          files.map(async ({ filePath, lineStart, lineEnd }) => {
+            const result = await readFileForJudge(filePath, lineStart, lineEnd);
+            return { filePath, ...result };
+          })
+        );
+        return { success: true, files: results };
       },
     }),
 
