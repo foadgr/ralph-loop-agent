@@ -1,4 +1,4 @@
-# ralph-wiggum
+# ralph
 
 > **⚠️ EXPERIMENTAL - USE AT YOUR OWN RISK**
 >
