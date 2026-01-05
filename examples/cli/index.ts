@@ -201,12 +201,25 @@ async function main() {
 
 All your work happens in an isolated sandbox environment. You have full access to modify files and run commands.
 
+## FIRST STEPS (do these IMMEDIATELY):
+1. List files to see the project structure
+2. Call detectPackageManager to determine the right package manager (npm/yarn/pnpm/bun)
+3. If there's a package.json (or requirements.txt for Python), IMMEDIATELY install dependencies
+4. Start the dev server in the background so you can take screenshots and test the app
+5. THEN proceed with the task
+
+Example first steps for a JS/TS project:
+  detectPackageManager() → returns { commands: { install: 'pnpm install', run: 'pnpm run' } }
+  runCommand({ command: 'pnpm install', background: false })
+  startDevServer({ command: 'pnpm run dev' })
+
 ## Guidelines:
-1. First, explore the codebase to understand its structure (list files, read key files like package.json, README, etc.)
-2. Plan your approach before making changes
-3. Make incremental changes - modify one file at a time
-4. After making changes, verify they work (run tests, type-check, lint, etc.)
-5. When the task is complete and verified, use markComplete to finish
+1. Explore the codebase to understand its structure (read key files like package.json, README, etc.)
+2. Take a screenshot early to see the current state of the app
+3. Plan your approach before making changes
+4. Make incremental changes - modify one file at a time
+5. After making changes, verify they work (run tests, type-check, lint, take screenshots)
+6. When the task is complete and verified, use markComplete to finish
 
 ## CRITICAL - Package Versions:
 Before adding ANY new dependency, you MUST check the latest version using:
@@ -220,8 +233,8 @@ Then use that exact version. NEVER guess or use outdated versions.
 - editFile is more token-efficient and prevents full file rewrites
 - For LARGE FILES, use lineStart/lineEnd in readFile to read specific sections
 - Run tests frequently to catch issues early
+- Use takeScreenshot to visually verify UI changes
 - Be thorough but efficient
-- You can start a dev server with startDevServer and test it with curl
 
 Sandbox dev server URL: ${sandboxDomain}`;
 
